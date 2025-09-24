@@ -1,0 +1,5 @@
+source_page,url,link_type,tag,attribute,text,status_code,status_text,error,response_time,final_url,content_type
+https://httpbin.org,mailto:me@kennethreitz.org,internal,a,href,Send email to the developer,,Request Failed,Request Error: No connection adapters were found for 'mailto:me@kennethreitz.org',,mailto:me@kennethreitz.org,
+https://httpbin.org/flasgger_static/swagger-ui.css,http://www.w3.org/2000/svg'%3E%3Cpath,external,text,content,http://www.w3.org/2000/svg'%3E%3Cpath,403,Forbidden,,0.15,http://www.w3.org/2000/svg'%3E%3Cpath,text/html
+https://httpbin.org/flasgger_static/swagger-ui.css,http://www.w3.org/2000/svg',external,text,content,http://www.w3.org/2000/svg',403,Forbidden,,0.04,http://www.w3.org/2000/svg',text/html
+https://httpbin.org/forms/post,https://httpbin.org/post,internal,form,action,Customer name:Telephone:E-mail address:Pizza SizeSmallMediumLargePizza ToppingsBaconExtra CheeseOnio,405,METHOD NOT ALLOWED,,0.91,https://httpbin.org/post,text/html
