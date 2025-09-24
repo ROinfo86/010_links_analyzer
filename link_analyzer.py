@@ -20,12 +20,88 @@ from urllib.parse import urljoin, urlparse
 import requests
 from urllib3.exceptions import InsecureRequestWarning
 
-# Добавляем текущую директорию в PYTHONPATH
-sys.path.insert(0, os.path.dirname(__file__))
-
-from link_analyzer import WebsiteCrawler
-
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+from bs4 import BeautifulSoup
+import urllib.robotparser
+import re
+
+class WebsiteCrawler:
+    """Краулер для обхода сайта и извлечения ссылок"""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip('/')
+        self.domain = urlparse(self.base_url).netloc
+        
+        # Загружаем robots.txt один раз
+        self.robots_parser = urllib.robotparser.RobotFileParser()
+        self.robots_parser.set_url(f"{self.base_url}/robots.txt")
+        try:
+            self.robots_parser.read()
+            logging.info(f"Robots.txt загружен с {self.base_url}/robots.txt")
+        except:
+            logging.warning(f"Не удалось загрузить robots.txt для {self.base_url}")
+            self.robots_parser = None
+    
+    def extract_links_from_page(self, html_content: str, page_url: str) -> List[Dict]:
+        """Извлекает все ссылки со страницы"""
+        soup = BeautifulSoup(html_content, 'lxml')
+        links = []
+        
+        # Регулярное выражение для URL (RFC 3986 compatible)
+        url_pattern = re.compile(
+            r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        )
+        
+        # Извлекаем ссылки из разных тегов
+        link_selectors = [
+            ('a', 'href'),
+            ('img', 'src'),
+            ('link', 'href'),
+            ('script', 'src'),
+            ('iframe', 'src'),
+            ('form', 'action')
+        ]
+        
+        for tag_name, attr_name in link_selectors:
+            for tag in soup.find_all(tag_name):
+                url = tag.get(attr_name)
+                if url:
+                    url = url.strip()
+                    if url and not url.startswith('#') and not url.startswith('javascript:'):
+                        # Нормализуем URL
+                        full_url = urljoin(page_url, url)
+                        
+                        # Пропускаем нежелательные ссылки
+                        if self._should_skip_url(full_url):
+                            continue
+                            
+                        # Определяем тип ссылки
+                        link_type = 'external'
+                        if urlparse(full_url).netloc == self.domain:
+                            link_type = 'internal'
+                        
+                        links.append({
+                            'url': full_url,
+                            'link_type': link_type,
+                            'found_in_tag': tag_name,
+                            'anchor_text': tag.get_text().strip() if tag_name == 'a' else ''
+                        })
+        
+        return links
+    
+    def _should_skip_url(self, url: str) -> bool:
+        """Проверяет, нужно ли пропустить URL"""
+        url_lower = url.lower()
+        
+        # Пропускаем tel:, mailto:, etc.
+        if any(url_lower.startswith(prefix) for prefix in ['tel:', 'mailto:', 'ftp:', 'data:']):
+            return True
+            
+        # Пропускаем cdn-cgi и подобные
+        if '/cdn-cgi/' in url_lower:
+            return True
+            
+        return False
 
 class ProperLinkAnalyzer:
     """Правильный анализатор по логике пользователя"""
