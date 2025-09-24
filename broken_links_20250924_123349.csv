@@ -1,4 +1,0 @@
-source_page,url,link_type,tag,attribute,text,status_code,status_text,error,response_time,final_url,content_type
-https://httpbin.org,mailto:me@kennethreitz.org,internal,a,href,Send email to the developer,,Request Failed,Request Error: No connection adapters were found for 'mailto:me@kennethreitz.org',,mailto:me@kennethreitz.org,
-https://httpbin.org/flasgger_static/swagger-ui-bundle.js,http://facebook.github.io/react/docs/error,external,text,content,http://facebook.github.io/react/docs/error,404,Not Found,,0.47,https://legacy.reactjs.org/docs/error,text/html
-https://httpbin.org/forms/post,https://httpbin.org/post,internal,form,action,Customer name:Telephone:E-mail address:Pizza SizeSmallMediumLargePizza ToppingsBaconExtra CheeseOnio,405,METHOD NOT ALLOWED,,7.49,https://httpbin.org/post,text/html

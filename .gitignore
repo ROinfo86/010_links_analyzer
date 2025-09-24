@@ -1,0 +1,9 @@
+*.csv
+*.txt
+*.log
+*.json
+*.xlsx
+okmart_reports/*
+link_analyzer.log
+debug_*
+test_*

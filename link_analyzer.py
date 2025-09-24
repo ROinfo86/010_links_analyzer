@@ -1,619 +1,446 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Website Link Analyzer
-Анализатор ссылок веб-сайта для поиска битых ссылок
-
-Автор: Анализатор битых ссылок
-Версия: 1.0
+ПРАВИЛЬНЫЙ анализатор ссылок - по логике пользователя:
+1. Сначала собираем базу всех СТРАНИЦ сайта
+2. Потом ищем все ссылки на каждой странице 
+3. Проверяем статус каждой уникальной ссылки
+4. Создаем отчет с привязкой битых ссылок к страницам
 """
 
-import requests
-import urllib3
-from urllib.parse import urljoin, urlparse, unquote
-from urllib.robotparser import RobotFileParser
-from bs4 import BeautifulSoup
-import re
-import json
-import csv
-import time
-import logging
-from datetime import datetime
-from typing import Set, Dict, List, Tuple
-import argparse
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import os
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+import logging
+from typing import Set, Dict, List
+from urllib.parse import urljoin, urlparse
+import requests
+from urllib3.exceptions import InsecureRequestWarning
 
-# Отключаем предупреждения SSL для некорректных сертификатов
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Добавляем текущую директорию в PYTHONPATH
+sys.path.insert(0, os.path.dirname(__file__))
 
-class WebsiteCrawler:
-    """Класс для обхода веб-сайта и анализа ссылок"""
+from link_analyzer import WebsiteCrawler
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+class ProperLinkAnalyzer:
+    """Правильный анализатор по логике пользователя"""
     
-    def __init__(self, base_url: str, max_pages: int = 100, delay: float = 1.0, 
-                 respect_robots: bool = True, timeout: int = 10, 
-                 max_workers: int = 5, user_agent: str = None):
+    def __init__(self, base_url: str, output_dir: str = "./proper_analysis", 
+                 delay: float = 1.0, max_workers: int = 3):
         """
-        Инициализация краулера
+        Инициализация анализатора
         
         Args:
-            base_url: Базовый URL сайта
-            max_pages: Максимальное количество страниц для обхода
-            delay: Задержка между запросами в секундах
-            respect_robots: Учитывать ли robots.txt
-            timeout: Таймаут для HTTP запросов
-            max_workers: Количество потоков для параллельной обработки
-            user_agent: User-Agent для запросов
+            base_url: URL сайта для анализа
+            output_dir: Директория для сохранения результатов
+            delay: Задержка между запросами
+            max_workers: Количество потоков для проверки ссылок
         """
         self.base_url = base_url.rstrip('/')
-        self.domain = urlparse(base_url).netloc
-        self.max_pages = max_pages
+        self.domain = urlparse(self.base_url).netloc
+        self.output_dir = Path(output_dir)
         self.delay = delay
-        self.timeout = timeout
         self.max_workers = max_workers
         
-        # Настройка User-Agent
-        self.user_agent = user_agent or (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-            '(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        )
+        # Создаем директории
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Настройка логирования (должно быть первым)
-        self._setup_logging()
-        
-        # Множества для хранения обработанных данных
-        self.visited_pages: Set[str] = set()
-        self.found_links: Dict[str, List[Dict]] = {}  # страница -> список ссылок
-        self.link_status: Dict[str, Dict] = {}  # ссылка -> статус
-        self.broken_links: List[Dict] = []
-        
-        # Настройка robots.txt
-        self.respect_robots = respect_robots
-        self.robot_parser = None
-        if respect_robots:
-            self._load_robots_txt()
+        # Базы данных
+        self.all_pages = set()  # База всех страниц сайта
+        self.all_links = {}     # {link_url: {'type': 'page/image/etc', 'found_on': [page1, page2]}}
+        self.link_statuses = {} # {link_url: {'status_code': 200, 'error': None, 'response_time': 1.5}}
         
         # Настройка сессии
-        self.session = self._create_session()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
         
-    def _setup_logging(self):
-        """Настройка логирования"""
+        # Настройка логирования
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler('link_analyzer.log', encoding='utf-8'),
-                logging.StreamHandler(sys.stdout)
+                logging.StreamHandler(sys.stdout),
+                logging.FileHandler(self.output_dir / "analysis.log", encoding='utf-8')
             ]
         )
+        self.logger = logging.getLogger(f"ProperAnalyzer_{self.base_url}")
+        
+        # Создаем ОДИН анализатор для всей работы
+        self.crawler = WebsiteCrawler(base_url=self.base_url)
+        self.logger.info(f"Создан единый анализатор для {self.base_url}")
         self.logger = logging.getLogger(__name__)
         
-    def _create_session(self) -> requests.Session:
-        """Создание сессии с настройками повторных попыток"""
-        session = requests.Session()
-        
-        # Настройка повторных попыток
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        
-        # Настройка заголовков
-        session.headers.update({
-            'User-Agent': self.user_agent,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        })
-        
-        return session
-        
-    def _load_robots_txt(self):
-        """Загрузка и парсинг robots.txt"""
-        try:
-            robots_url = urljoin(self.base_url, '/robots.txt')
-            self.robot_parser = RobotFileParser()
-            self.robot_parser.set_url(robots_url)
-            self.robot_parser.read()
-            self.logger.info(f"Robots.txt загружен с {robots_url}")
-        except Exception as e:
-            self.logger.warning(f"Не удалось загрузить robots.txt: {e}")
-            self.robot_parser = None
-            
-    def _can_fetch(self, url: str) -> bool:
-        """Проверка разрешения на обход URL согласно robots.txt"""
-        if not self.robot_parser:
-            return True
-        try:
-            return self.robot_parser.can_fetch(self.user_agent, url)
-        except:
-            return True
-            
     def _is_same_domain(self, url: str) -> bool:
-        """Проверка принадлежности URL к тому же домену"""
+        """Проверяет, принадлежит ли URL тому же домену"""
         try:
             parsed = urlparse(url)
-            return parsed.netloc == self.domain or parsed.netloc == ''
+            return parsed.netloc == self.domain
         except:
             return False
-            
-    def _normalize_url(self, url: str, base_url: str) -> str:
-        """Нормализация URL"""
-        try:
-            # Удаляем якоря (но сохраняем их если они важны для идентификации)
-            anchor = ''
-            if '#' in url:
-                url, anchor = url.split('#', 1)
-            
-            # Создаем абсолютный URL
-            absolute_url = urljoin(base_url, url)
-            
-            # НЕ декодируем URL - сохраняем %-encoding как есть
-            # absolute_url = unquote(absolute_url)  # Комментируем эту строку
-            
-            # Добавляем якорь обратно если он был
-            if anchor:
-                absolute_url += '#' + anchor
+    
+    def _is_html_page(self, url: str) -> bool:
+        """Проверяет, является ли URL HTML страницей (не файлом)"""
+        # Исключаем файлы по расширению
+        excluded_extensions = [
+            '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.ico',
+            '.css', '.js', '.xml', '.pdf', '.zip', '.rar', '.txt',
+            '.doc', '.docx', '.xls', '.xlsx', '.mp4', '.avi', '.mp3'
+        ]
+        
+        url_lower = url.lower()
+        for ext in excluded_extensions:
+            if url_lower.endswith(ext):
+                return False
                 
-            return absolute_url.rstrip('/')
-        except:
-            return url
-            
-    def extract_links_from_page(self, url: str, html_content: str) -> List[Dict]:
-        """
-        Извлечение всех ссылок со страницы
-        
-        Args:
-            url: URL страницы
-            html_content: HTML содержимое страницы
-            
-        Returns:
-            Список словарей с информацией о ссылках
-        """
-        links = []
-        
-        try:
-            soup = BeautifulSoup(html_content, 'lxml')
-            
-            # Извлекаем ссылки из различных тегов и атрибутов
-            link_selectors = [
-                ('a', 'href'),
-                ('link', 'href'),
-                ('img', 'src'),
-                ('script', 'src'),
-                ('iframe', 'src'),
-                ('frame', 'src'),
-                ('embed', 'src'),
-                ('object', 'data'),
-                ('source', 'src'),
-                ('video', 'src'),
-                ('audio', 'src'),
-                ('form', 'action'),
-                ('area', 'href'),
-                ('base', 'href'),
-            ]
-            
-            # Извлечение ссылок из тегов
-            for tag_name, attr_name in link_selectors:
-                elements = soup.find_all(tag_name, {attr_name: True})
-                for element in elements:
-                    link_url = element.get(attr_name, '').strip()
-                    if link_url:
-                        normalized_url = self._normalize_url(link_url, url)
-                        if normalized_url and normalized_url != url:
-                            links.append({
-                                'url': normalized_url,
-                                'source_page': url,
-                                'tag': tag_name,
-                                'attribute': attr_name,
-                                'text': element.get_text(strip=True)[:100] if element.get_text(strip=True) else '',
-                                'link_type': 'internal' if self._is_same_domain(normalized_url) else 'external'
-                            })
-            
-            # Поиск URL в тексте (улучшенный regex с правильными границами)
-            text_content = soup.get_text()
-            # Паттерн включает все допустимые символы в URL включая %-encoding
-            # Исключаем символы которые обычно завершают URL в тексте
-            url_pattern = re.compile(
-                r'https?://[^\s<>"{}|\\^`\[\]()]+(?:\([^\s)]*\))*[^\s<>"{}|\\^`\[\]().,;:!?]',
-                re.IGNORECASE
-            )
-            
-            text_urls = url_pattern.findall(text_content)
-            for text_url in text_urls:
-                normalized_url = self._normalize_url(text_url, url)
-                if normalized_url and normalized_url != url:
-                    # Проверяем, что эта ссылка уже не найдена в тегах
-                    existing_urls = [link['url'] for link in links]
-                    if normalized_url not in existing_urls:
-                        links.append({
-                            'url': normalized_url,
-                            'source_page': url,
-                            'tag': 'text',
-                            'attribute': 'content',
-                            'text': text_url[:100],
-                            'link_type': 'internal' if self._is_same_domain(normalized_url) else 'external'
-                        })
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка при извлечении ссылок с {url}: {e}")
-            
-        return links
-        
-    def check_link_status(self, link_info: Dict) -> Dict:
-        """
-        Проверка статуса ссылки
-        
-        Args:
-            link_info: Словарь с информацией о ссылке
-            
-        Returns:
-            Словарь с результатами проверки
-        """
-        url = link_info['url']
-        result = {
-            'url': url,
-            'status_code': None,
-            'status_text': '',
-            'response_time': None,
-            'error': None,
-            'redirect_url': None,
-            'content_type': None,
-            'final_url': url
-        }
-        
-        try:
-            start_time = time.time()
-            
-            # Выполняем HEAD запрос сначала (быстрее)
-            try:
-                response = self.session.head(
-                    url, 
-                    timeout=self.timeout, 
-                    allow_redirects=True,
-                    verify=False  # Игнорируем SSL ошибки
-                )
+        # Исключаем служебные пути
+        excluded_paths = ['/cdn-cgi/', '/admin/', '/api/']
+        for path in excluded_paths:
+            if path in url_lower:
+                return False
                 
-                # Если HEAD не поддерживается, делаем GET
-                if response.status_code == 405:
-                    response = self.session.get(
-                        url, 
-                        timeout=self.timeout, 
-                        allow_redirects=True,
-                        verify=False,
-                        stream=True  # Не загружаем весь контент
-                    )
-                    
-            except requests.exceptions.SSLError:
-                # Если SSL ошибка, пробуем без проверки сертификата
-                response = self.session.get(
-                    url, 
-                    timeout=self.timeout, 
-                    allow_redirects=True,
-                    verify=False,
-                    stream=True
-                )
-            
-            end_time = time.time()
-            
-            result.update({
-                'status_code': response.status_code,
-                'status_text': response.reason or '',
-                'response_time': round(end_time - start_time, 2),
-                'final_url': response.url,
-                'content_type': response.headers.get('content-type', '').split(';')[0]
-            })
-            
-            # Проверяем, был ли редирект
-            if response.url != url:
-                result['redirect_url'] = response.url
-                
-        except requests.exceptions.Timeout:
-            result['error'] = 'Timeout'
-            result['status_text'] = 'Request Timeout'
-        except requests.exceptions.ConnectionError as e:
-            result['error'] = f'Connection Error: {str(e)}'
-            result['status_text'] = 'Connection Failed'
-        except requests.exceptions.TooManyRedirects:
-            result['error'] = 'Too Many Redirects'
-            result['status_text'] = 'Redirect Loop'
-        except requests.exceptions.RequestException as e:
-            result['error'] = f'Request Error: {str(e)}'
-            result['status_text'] = 'Request Failed'
-        except Exception as e:
-            result['error'] = f'Unknown Error: {str(e)}'
-            result['status_text'] = 'Unknown Error'
-            
-        return result
+        return True
+    
+    def step1_collect_all_pages(self, max_pages: int = 1000) -> int:
+        """
+        ЭТАП 1: Собираем базу всех СТРАНИЦ сайта (ОПТИМИЗИРОВАННО)
+        Returns: количество найденных страниц
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("ЭТАП 1: БЫСТРЫЙ СБОР ВСЕХ СТРАНИЦ САЙТА")
+        self.logger.info(f"Максимум страниц: {max_pages}")
+        self.logger.info("=" * 60)
         
-    def crawl_website(self):
-        """Основной метод для обхода веб-сайта"""
-        self.logger.info(f"Начинаем обход сайта: {self.base_url}")
-        
-        # Начинаем с главной страницы
         pages_to_visit = [self.base_url]
-        pages_visited = 0
+        pages_to_visit_set = {self.base_url}
+        processed_count = 0
         
-        while pages_to_visit and pages_visited < self.max_pages:
-            current_url = pages_to_visit.pop(0)
+        while pages_to_visit and processed_count < max_pages:
+            # Обрабатываем пакетами по несколько страниц
+            batch_size = min(5, len(pages_to_visit))
+            current_batch = []
             
-            # Пропускаем уже посещенные страницы
-            if current_url in self.visited_pages:
-                continue
+            for _ in range(batch_size):
+                if pages_to_visit:
+                    page = pages_to_visit.pop(0)
+                    if page not in self.all_pages:
+                        current_batch.append(page)
+                        
+            if not current_batch:
+                break
                 
-            # Проверяем robots.txt
-            if not self._can_fetch(current_url):
-                self.logger.info(f"Пропускаем {current_url} согласно robots.txt")
-                continue
-                
+            self.logger.info(f"Обрабатываем пакет из {len(current_batch)} страниц...")
+            
+            batch_new_pages = 0
+            for current_page in current_batch:
+                try:
+                    response = self.session.get(current_page, timeout=15, verify=False)
+                    response.raise_for_status()
+                    
+                    # Добавляем страницу в базу
+                    self.all_pages.add(current_page)
+                    processed_count += 1
+                    
+                    # Используем ЕДИНЫЙ анализатор (robots.txt уже загружен!)
+                    links = self.crawler.extract_links_from_page(response.text, current_page)
+                    
+                    # Собираем ВСЕ новые страницы сразу
+                    for link in links:
+                        link_url = link['url']
+                        
+                        if (link['link_type'] == 'internal' and 
+                            self._is_html_page(link_url) and
+                            link_url not in self.all_pages and
+                            link_url not in pages_to_visit_set):
+                            
+                            pages_to_visit.append(link_url)
+                            pages_to_visit_set.add(link_url)
+                            batch_new_pages += 1
+                    
+                    time.sleep(self.delay * 0.2)  # Меньшая задержка внутри пакета
+                    
+                except Exception as e:
+                    self.logger.error(f"Ошибка при сканировании {current_page}: {e}")
+                    continue
+            
+            self.logger.info(f"Пакет обработан: +{batch_new_pages} новых страниц")
+            self.logger.info(f"Всего страниц: {len(self.all_pages)}, в очереди: {len(pages_to_visit)}")
+            
+            # Задержка между пакетами
+            time.sleep(self.delay)
+        
+        self.logger.info(f"ЭТАП 1 ЗАВЕРШЕН: Найдено {len(self.all_pages)} страниц")
+        
+        # Сохраняем базу страниц
+        pages_file = self.output_dir / "all_pages.json"
+        with open(pages_file, 'w', encoding='utf-8') as f:
+            json.dump(list(self.all_pages), f, ensure_ascii=False, indent=2)
+            
+        return len(self.all_pages)
+    
+    def step2_collect_all_links(self) -> int:
+        """
+        ЭТАП 2: Собираем ВСЕ ссылки с каждой страницы
+        Returns: количество уникальных ссылок
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("ЭТАП 2: СБОР ВСЕХ ССЫЛОК С КАЖДОЙ СТРАНИЦЫ") 
+        self.logger.info("=" * 60)
+        
+        processed_pages = 0
+        
+        for page_url in self.all_pages:
             try:
-                self.logger.info(f"Обрабатываем страницу {pages_visited + 1}/{self.max_pages}: {current_url}")
+                self.logger.info(f"Извлекаем ссылки со страницы {processed_pages + 1}/{len(self.all_pages)}: {page_url}")
                 
-                # Запрашиваем страницу
-                response = self.session.get(
-                    current_url, 
-                    timeout=self.timeout,
-                    verify=False
-                )
+                response = self.session.get(page_url, timeout=15, verify=False)
                 response.raise_for_status()
                 
-                # Добавляем в посещенные
-                self.visited_pages.add(current_url)
-                pages_visited += 1
+                # Используем ЕДИНЫЙ анализатор
+                links = self.crawler.extract_links_from_page(response.text, page_url)
                 
-                # Извлекаем ссылки
-                links = self.extract_links_from_page(current_url, response.text)
-                self.found_links[current_url] = links
-                
-                self.logger.info(f"Найдено {len(links)} ссылок на странице {current_url}")
-                
-                # Добавляем новые внутренние страницы для обхода
+                # Обрабатываем все найденные ссылки
+                new_links_count = 0
                 for link in links:
                     link_url = link['url']
-                    if (link['link_type'] == 'internal' and 
-                        link_url not in self.visited_pages and 
-                        link_url not in pages_to_visit and
-                        self._is_same_domain(link_url)):
-                        pages_to_visit.append(link_url)
+                    
+                    # Определяем тип ссылки
+                    link_type = 'external'
+                    if link['link_type'] == 'internal':
+                        if self._is_html_page(link_url):
+                            link_type = 'page'
+                        elif any(link_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp']):
+                            link_type = 'image'
+                        elif any(link_url.lower().endswith(ext) for ext in ['.css', '.js']):
+                            link_type = 'resource'
+                        else:
+                            link_type = 'file'
+                    
+                    # Добавляем в базу ссылок
+                    if link_url not in self.all_links:
+                        self.all_links[link_url] = {
+                            'type': link_type,
+                            'found_on': [page_url]
+                        }
+                        new_links_count += 1
+                    else:
+                        # Добавляем страницу в список, где найдена ссылка (если еще нет)
+                        if page_url not in self.all_links[link_url]['found_on']:
+                            self.all_links[link_url]['found_on'].append(page_url)
                 
-                # Задержка между запросами
+                processed_pages += 1
+                self.logger.info(f"Найдено {new_links_count} новых уникальных ссылок")
+                self.logger.info(f"Всего уникальных ссылок: {len(self.all_links)}")
+                
                 time.sleep(self.delay)
                 
             except Exception as e:
-                self.logger.error(f"Ошибка при обработке {current_url}: {e}")
+                self.logger.error(f"Ошибка при обработке {page_url}: {e}")
                 continue
-                
-        self.logger.info(f"Обход завершен. Посещено страниц: {pages_visited}")
         
-    def check_all_links(self):
-        """Проверка всех найденных ссылок"""
-        # Собираем все уникальные ссылки
-        all_links = {}
-        for page_url, links in self.found_links.items():
-            for link in links:
-                link_url = link['url']
-                if link_url not in all_links:
-                    all_links[link_url] = []
-                all_links[link_url].append(link)
+        self.logger.info(f"ЭТАП 2 ЗАВЕРШЕН: Найдено {len(self.all_links)} уникальных ссылок")
         
-        total_links = len(all_links)
-        self.logger.info(f"Начинаем проверку {total_links} уникальных ссылок")
-        
-        # Проверяем ссылки параллельно
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Создаем задачи для проверки ссылок
-            future_to_url = {}
-            for link_url, link_instances in all_links.items():
-                # Берем первый экземпляр ссылки для проверки
-                future = executor.submit(self.check_link_status, link_instances[0])
-                future_to_url[future] = (link_url, link_instances)
+        # Сохраняем базу ссылок
+        links_file = self.output_dir / "all_links.json"
+        with open(links_file, 'w', encoding='utf-8') as f:
+            json.dump(self.all_links, f, ensure_ascii=False, indent=2)
             
-            # Обрабатываем результаты
-            completed = 0
-            for future in as_completed(future_to_url):
-                link_url, link_instances = future_to_url[future]
-                completed += 1
+        return len(self.all_links)
+    
+    def step3_check_link_statuses(self) -> Dict:
+        """
+        ЭТАП 3: Проверяем статус каждой уникальной ссылки
+        Returns: статистика проверки
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("ЭТАП 3: ПРОВЕРКА СТАТУСА КАЖДОЙ ССЫЛКИ")
+        self.logger.info("=" * 60)
+        
+        total_links = len(self.all_links)
+        checked_links = 0
+        broken_links = 0
+        
+        for link_url in self.all_links:
+            try:
+                checked_links += 1
+                self.logger.info(f"Проверяем ссылку {checked_links}/{total_links}: {link_url}")
                 
-                try:
-                    result = future.result()
-                    self.link_status[link_url] = result
+                start_time = time.time()
+                response = self.session.get(link_url, timeout=10, verify=False)
+                response_time = time.time() - start_time
+                
+                status_code = response.status_code
+                error = None
+                
+                if status_code != 200:
+                    broken_links += 1
                     
-                    # Логируем прогресс
-                    if completed % 10 == 0 or completed == total_links:
-                        self.logger.info(f"Проверено ссылок: {completed}/{total_links}")
-                    
-                    # Если ссылка битая, добавляем в список проблемных
-                    status_code = result.get('status_code')
-                    if (status_code is None or status_code >= 400 or 
-                        result.get('error') is not None):
-                        
-                        for link_instance in link_instances:
-                            broken_link = {
-                                **link_instance,
-                                **result
-                            }
-                            self.broken_links.append(broken_link)
-                            
-                except Exception as e:
-                    self.logger.error(f"Ошибка при проверке {link_url}: {e}")
-                    
-        self.logger.info(f"Проверка завершена. Найдено битых ссылок: {len(self.broken_links)}")
+            except Exception as e:
+                status_code = None
+                error = str(e)
+                response_time = None
+                broken_links += 1
+            
+            # Сохраняем результат
+            self.link_statuses[link_url] = {
+                'status_code': status_code,
+                'error': error,
+                'response_time': response_time,
+                'checked_at': datetime.now().isoformat()
+            }
+            
+            if checked_links % 50 == 0:
+                self.logger.info(f"Проверено {checked_links}/{total_links} ссылок, битых: {broken_links}")
+            
+            time.sleep(self.delay * 0.5)  # Меньшая задержка для проверки
         
-    def generate_reports(self, output_dir: str = "."):
-        """Генерация отчетов в различных форматах"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # JSON отчет
-        json_report = {
-            'scan_info': {
-                'base_url': self.base_url,
-                'scan_date': datetime.now().isoformat(),
-                'pages_scanned': len(self.visited_pages),
-                'total_links_found': sum(len(links) for links in self.found_links.values()),
-                'unique_links': len(self.link_status),
-                'broken_links_count': len(self.broken_links)
-            },
-            'visited_pages': list(self.visited_pages),
-            'broken_links': self.broken_links,
-            'all_links_status': self.link_status
+        stats = {
+            'total_links': total_links,
+            'checked_links': checked_links,
+            'broken_links': broken_links,
+            'working_links': checked_links - broken_links
         }
         
-        json_filename = f"{output_dir}/link_analysis_{timestamp}.json"
-        with open(json_filename, 'w', encoding='utf-8') as f:
-            json.dump(json_report, f, ensure_ascii=False, indent=2)
+        self.logger.info(f"ЭТАП 3 ЗАВЕРШЕН: Проверено {checked_links} ссылок, битых: {broken_links}")
         
-        # CSV отчет с битыми ссылками
-        csv_filename = f"{output_dir}/broken_links_{timestamp}.csv"
-        if self.broken_links:
-            with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
-                fieldnames = [
-                    'source_page', 'url', 'link_type', 'tag', 'attribute', 
-                    'text', 'status_code', 'status_text', 'error', 
-                    'response_time', 'final_url', 'content_type'
-                ]
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                for link in self.broken_links:
-                    row = {field: link.get(field, '') for field in fieldnames}
-                    writer.writerow(row)
-        
-        # Текстовый отчет
-        txt_filename = f"{output_dir}/link_analysis_report_{timestamp}.txt"
-        with open(txt_filename, 'w', encoding='utf-8') as f:
-            f.write(f"ОТЧЕТ ОБ АНАЛИЗЕ ССЫЛОК\n")
-            f.write(f"=" * 50 + "\n\n")
-            f.write(f"Сайт: {self.base_url}\n")
-            f.write(f"Дата сканирования: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Обработано страниц: {len(self.visited_pages)}\n")
-            f.write(f"Найдено уникальных ссылок: {len(self.link_status)}\n")
-            f.write(f"Найдено битых ссылок: {len(self.broken_links)}\n\n")
+        # Сохраняем статусы
+        statuses_file = self.output_dir / "link_statuses.json"
+        with open(statuses_file, 'w', encoding='utf-8') as f:
+            json.dump(self.link_statuses, f, ensure_ascii=False, indent=2)
             
-            if self.broken_links:
-                f.write("БИТЫЕ ССЫЛКИ:\n")
-                f.write("-" * 30 + "\n\n")
-                
-                # Группируем по исходным страницам
-                broken_by_page = {}
-                for link in self.broken_links:
-                    page = link['source_page']
-                    if page not in broken_by_page:
-                        broken_by_page[page] = []
-                    broken_by_page[page].append(link)
-                
-                for page, links in broken_by_page.items():
-                    f.write(f"Страница: {page}\n")
-                    for link in links:
-                        f.write(f"  - {link['url']}\n")
-                        f.write(f"    Статус: {link.get('status_code', 'N/A')} - {link.get('status_text', '')}\n")
-                        f.write(f"    Тип: {link['link_type']}\n")
-                        if link.get('error'):
-                            f.write(f"    Ошибка: {link['error']}\n")
-                        f.write("\n")
-            
-        self.logger.info(f"Отчеты сохранены:")
-        self.logger.info(f"  - JSON: {json_filename}")
-        self.logger.info(f"  - CSV: {csv_filename}")
-        self.logger.info(f"  - TXT: {txt_filename}")
-
-
-def main():
-    """Главная функция программы"""
-    parser = argparse.ArgumentParser(
-        description='Анализатор битых ссылок веб-сайта',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Примеры использования:
-  python link_analyzer.py https://example.com
-  python link_analyzer.py https://example.com --max-pages 50 --delay 0.5
-  python link_analyzer.py https://example.com --output ./reports --no-robots
+        return stats
+    
+    def step4_create_reports(self) -> None:
         """
-    )
-    
-    parser.add_argument('url', help='URL сайта для анализа')
-    parser.add_argument('--max-pages', type=int, default=100, 
-                        help='Максимальное количество страниц для обхода (по умолчанию: 100)')
-    parser.add_argument('--delay', type=float, default=1.0,
-                        help='Задержка между запросами в секундах (по умолчанию: 1.0)')
-    parser.add_argument('--timeout', type=int, default=10,
-                        help='Таймаут для HTTP запросов в секундах (по умолчанию: 10)')
-    parser.add_argument('--max-workers', type=int, default=5,
-                        help='Количество потоков для проверки ссылок (по умолчанию: 5)')
-    parser.add_argument('--output', default='.',
-                        help='Директория для сохранения отчетов (по умолчанию: текущая)')
-    parser.add_argument('--no-robots', action='store_true',
-                        help='Игнорировать robots.txt')
-    parser.add_argument('--user-agent', 
-                        help='Кастомный User-Agent для запросов')
-                        
-    args = parser.parse_args()
-    
-    # Проверяем URL
-    if not args.url.startswith(('http://', 'https://')):
-        print("Ошибка: URL должен начинаться с http:// или https://")
-        sys.exit(1)
-    
-    try:
-        # Создаем экземпляр краулера
-        crawler = WebsiteCrawler(
-            base_url=args.url,
-            max_pages=args.max_pages,
-            delay=args.delay,
-            respect_robots=not args.no_robots,
-            timeout=args.timeout,
-            max_workers=args.max_workers,
-            user_agent=args.user_agent
-        )
+        ЭТАП 4: Создаем отчеты с привязкой битых ссылок к страницам
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("ЭТАП 4: СОЗДАНИЕ ОТЧЕТОВ")
+        self.logger.info("=" * 60)
         
-        # Выполняем анализ
-        print(f"Начинаем анализ сайта: {args.url}")
-        print(f"Максимум страниц: {args.max_pages}")
-        print(f"Задержка между запросами: {args.delay}s")
-        print(f"Потоков для проверки ссылок: {args.max_workers}")
-        print("-" * 50)
+        # Отчет битых ссылок с привязкой к страницам
+        broken_links_report = {}
         
+        for link_url, link_info in self.all_links.items():
+            status = self.link_statuses.get(link_url, {})
+            
+            # Если ссылка битая
+            if (status.get('status_code') != 200 or status.get('error')):
+                broken_links_report[link_url] = {
+                    'type': link_info['type'],
+                    'status_code': status.get('status_code'),
+                    'error': status.get('error'),
+                    'found_on_pages': link_info['found_on'],
+                    'pages_count': len(link_info['found_on'])
+                }
+        
+        # Сохраняем отчет битых ссылок
+        broken_report_file = self.output_dir / "broken_links_report.json"
+        with open(broken_report_file, 'w', encoding='utf-8') as f:
+            json.dump(broken_links_report, f, ensure_ascii=False, indent=2)
+        
+        # Создаем текстовый отчет
+        txt_report_file = self.output_dir / "analysis_report.txt"
+        with open(txt_report_file, 'w', encoding='utf-8') as f:
+            f.write("АНАЛИЗ ССЫЛОК САЙТА\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(f"Сайт: {self.base_url}\n")
+            f.write(f"Дата анализа: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            f.write("СТАТИСТИКА:\n")
+            f.write(f"Всего страниц на сайте: {len(self.all_pages)}\n")
+            f.write(f"Всего уникальных ссылок: {len(self.all_links)}\n")
+            f.write(f"Битых ссылок: {len(broken_links_report)}\n\n")
+            
+            f.write("БИТЫЕ ССЫЛКИ ПО СТРАНИЦАМ:\n")
+            f.write("-" * 50 + "\n")
+            
+            for link_url, info in broken_links_report.items():
+                f.write(f"\nБитая ссылка: {link_url}\n")
+                f.write(f"Тип: {info['type']}\n")
+                f.write(f"Статус: {info['status_code'] or 'ERROR'}\n")
+                if info['error']:
+                    f.write(f"Ошибка: {info['error']}\n")
+                f.write(f"Найдена на {info['pages_count']} страницах:\n")
+                for page in info['found_on_pages']:
+                    f.write(f"  - {page}\n")
+                f.write("\n" + "-" * 30 + "\n")
+        
+        self.logger.info(f"Отчеты созданы:")
+        self.logger.info(f"  JSON: {broken_report_file}")
+        self.logger.info(f"  TXT: {txt_report_file}")
+    
+    def run_full_analysis(self) -> Dict:
+        """Запускает полный анализ по правильной логике"""
         start_time = time.time()
         
-        # Обходим сайт
-        crawler.crawl_website()
+        self.logger.info("ЗАПУСК ПОЛНОГО АНАЛИЗА САЙТА")
+        self.logger.info(f"Сайт: {self.base_url}")
+        self.logger.info(f"Задержка: {self.delay}с")
+        self.logger.info("=" * 60)
         
-        # Проверяем все ссылки
-        crawler.check_all_links()
-        
-        # Генерируем отчеты
-        crawler.generate_reports(args.output)
-        
-        end_time = time.time()
-        total_time = round(end_time - start_time, 2)
-        
-        print("-" * 50)
-        print("АНАЛИЗ ЗАВЕРШЕН")
-        print(f"Время выполнения: {total_time} секунд")
-        print(f"Обработано страниц: {len(crawler.visited_pages)}")
-        print(f"Найдено уникальных ссылок: {len(crawler.link_status)}")
-        print(f"Битых ссылок: {len(crawler.broken_links)}")
-        
-        if crawler.broken_links:
-            print("\nТОП-10 БИТЫХ ССЫЛОК:")
-            for i, link in enumerate(crawler.broken_links[:10], 1):
-                print(f"{i}. {link['url']} (статус: {link.get('status_code', 'N/A')})")
-        
-    except KeyboardInterrupt:
-        print("\nАнализ прерван пользователем")
-        sys.exit(0)
-    except Exception as e:
-        print(f"Критическая ошибка: {e}")
-        sys.exit(1)
+        try:
+            # ЭТАП 1: Собираем все страницы
+            pages_count = self.step1_collect_all_pages()
+            
+            # ЭТАП 2: Собираем все ссылки
+            links_count = self.step2_collect_all_links()
+            
+            # ЭТАП 3: Проверяем статусы
+            stats = self.step3_check_link_statuses()
+            
+            # ЭТАП 4: Создаем отчеты
+            self.step4_create_reports()
+            
+            total_time = time.time() - start_time
+            
+            final_stats = {
+                'pages_found': pages_count,
+                'links_found': links_count,
+                'broken_links': stats['broken_links'],
+                'analysis_time': total_time
+            }
+            
+            self.logger.info("=" * 60)
+            self.logger.info("АНАЛИЗ ЗАВЕРШЕН УСПЕШНО!")
+            self.logger.info(f"Время выполнения: {total_time:.1f} секунд")
+            self.logger.info(f"Найдено страниц: {pages_count}")
+            self.logger.info(f"Найдено ссылок: {links_count}")
+            self.logger.info(f"Битых ссылок: {stats['broken_links']}")
+            self.logger.info("=" * 60)
+            
+            return final_stats
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при анализе: {e}")
+            raise
 
+def main():
+    """Главная функция"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Правильный анализ ссылок сайта по этапам')
+    parser.add_argument('url', help='URL сайта для анализа')
+    parser.add_argument('--delay', type=float, default=1.0, help='Задержка между запросами')
+    parser.add_argument('--workers', type=int, default=3, help='Количество потоков')
+    parser.add_argument('--output', default='./proper_analysis', help='Директория для результатов')
+    
+    args = parser.parse_args()
+    
+    analyzer = ProperLinkAnalyzer(
+        base_url=args.url,
+        output_dir=args.output,
+        delay=args.delay,
+        max_workers=args.workers
+    )
+    
+    analyzer.run_full_analysis()
 
 if __name__ == "__main__":
     main()
