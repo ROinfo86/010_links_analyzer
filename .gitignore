@@ -1,9 +1,26 @@
+# Результаты анализа
 *.csv
-*.txt
-*.log
 *.json
-*.xlsx
-okmart_reports/*
-link_analyzer.log
-debug_*
-test_*
+*.log
+link_analysis_*/
+analysis.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
